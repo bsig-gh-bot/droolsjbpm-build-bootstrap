@@ -1,0 +1,345 @@
+import org.jenkinsci.plugins.workflow.libs.Library
+@Library('jenkins-pipeline-shared-libraries')_
+
+import org.kie.jenkins.MavenCommand
+import org.kie.jenkins.MavenStagingHelper
+
+deployProperties = [:]
+
+pipeline {
+    agent {
+        label 'kie-rhel7'
+    }
+
+    tools {
+        maven 'kie-maven-3.6.3'
+        jdk 'kie-jdk1.8'
+    }
+
+    options {
+        buildDiscarder logRotator(artifactDaysToKeepStr: '', artifactNumToKeepStr: '', daysToKeepStr: '', numToKeepStr: '10')
+        timeout(time: 360, unit: 'MINUTES')
+    }
+
+    parameters {
+        string(name: 'DISPLAY_NAME', defaultValue: '', description: 'Setup a specific build display name')
+
+        // Git information
+        string(name: 'BUILD_BRANCH_NAME', defaultValue: 'master', description: 'Which branch to build? Set if you are not on a multibranch pipeline.')
+        string(name: 'GIT_AUTHOR', defaultValue: 'kiegroup', description: 'Which Git author repository ?')
+
+        // Build&test information
+        booleanParam(name: 'SKIP_MAVEN_BUILD', defaultValue: false, description: 'Skip maven build validation')
+        string(name: 'MAVEN_SETTINGS_CONFIG_FILE_ID', defaultValue: 'kogito_release_settings', description: 'Maven settings configfile to use in pipeline for Maven commands')
+
+        // Deploy information
+        string(name: 'MAVEN_DEPLOY_REPOSITORY', defaultValue: '', description: 'Specify a Maven repository to deploy the artifacts.')
+
+        // Release information
+        string(name: 'PROJECT_VERSION', defaultValue: 'revapi', description: 'Optional if not RELEASE. If RELEASE, cannot be empty.')
+
+        // Nexus staging default parameters
+        string(name: 'NEXUS_RELEASE_URL', defaultValue: 'https://repository.jboss.org/nexus', description: 'Nexus URL for release staging')
+        string(name: 'NEXUS_RELEASE_REPOSITORY_ID', defaultValue: 'jboss-releases-repository', description: 'Nexus Release repository ID for staging')
+        string(name: 'NEXUS_STAGING_PROFILE_ID', defaultValue: '2161b7b8da0080', description: 'Nexus staging profile ID for release process ')
+        string(name: 'NEXUS_BUILD_PROMOTION_PROFILE_ID', defaultValue: 'ea49ccd6f174', description: 'Nexus Build Promotion profile ID for release process')
+
+        // Bot author information. Set as params for easy testing.
+        string(name: 'GIT_AUTHOR_BOT', defaultValue: 'bsig-gh-bot', description: 'From which author should the PR be created ?')
+        string(name: 'BOT_CREDENTIALS_ID', defaultValue: 'bsig-gh-bot', description: 'Credentials for PR creation')
+
+        // Revapi branch name
+        string(name: 'REVAPI_RELEASE_VERSION', defaultValue: '', description: 'Release version to apply revapi clean to. E.g. 7.49.Final')
+
+        // Revapi repos
+        string(name: 'MASTER_REVAPI_REPOSITORIES', defaultValue: 'droolsjbpm-build-bootstrap,appformer,droolsjbpm-knowledge,drools,jbpm,droolsjbpm-integration', description: 'Master Revapi repositories')
+        string(name: 'BRANCHED_7_REVAPI_REPOSITORIES', defaultValue: 'optaplanner', description: 'Master Revapi repository for optaplanner')
+
+        // Merge PR?
+        booleanParam(name: 'MERGE_PR', defaultValue: false, description: 'Merge PR automatically')
+    }
+
+    environment {
+        MAVEN_OPTS = '-Xms1024m -Xmx4g'
+
+        BOT_BRANCH_HASH = "${util.generateHash(10)}"
+
+        // Maven configuration
+        MAVEN_DEPLOY_LOCAL_DIR="${WORKSPACE}/maven_deploy_dir"
+    }
+
+    stages {
+        stage('Initialize') {
+            steps {
+                script {
+                    cleanWs()
+
+                    if (params.DISPLAY_NAME != '') {
+                        currentBuild.displayName = params.DISPLAY_NAME
+                    }
+
+                    assert getProjectVersion() != ''
+
+                    assert getBranched7RevapiRepos() != ''
+                    assert getMasterRevapiRepos() != ''
+                    assert getRevapiProjectName() != 'revapi-'
+
+                    checkoutRepo("${getMasterRevapiRepos()}", "master")
+                    checkoutRepo("${getBranched7RevapiRepos()}", "7.x")
+                }
+            }
+            post {
+                success {
+                    script {
+                        setDeployPropertyIfNeeded('git.branch', getBuildBranch())
+                        setDeployPropertyIfNeeded('git.author', getGitAuthor())
+                        setDeployPropertyIfNeeded('project.version', getRevapiProjectName())
+                    }
+                }
+            }
+        }
+        stage('Prepare for PR'){
+            steps {
+                prepareForPR("${getRevapiRepos()}")
+            }
+        }
+        stage('Update project version'){
+            when {
+                expression { return getProjectVersion() != '' }
+            }
+            steps {
+                script {
+                    // Set version
+                    maven.mvnVersionsSet(getMavenCommand('droolsjbpm-build-bootstrap'), getRevapiProjectName())
+                }
+            }
+        }
+        stage('Execute Revapi clean-up'){
+            steps {
+                script {
+                    // Execute revapi-clean script and build projects
+                    executeRevapiClean()
+                }
+            }
+        }
+        stage('Build & Test') {
+            when {
+                expression { return !isSkipMavenBuild() }
+            }
+            steps {
+                script {
+                    executeMavenBuild("${getRevapiRepos()}")
+                }
+            }
+        }
+        stage('Create PRs') {
+            steps {
+                script {
+                    commitAndCreatePR("${getRevapiRepos()}")
+                }
+            }
+        }
+//        stage('Merge PR'){
+//            when {
+//                expression { return isMergePR() }
+//            }
+//            steps {
+//                commitAndCreatePR('droolsjbpm-build-bootstrap')
+//            }
+//            post {
+//                success {
+//                    script {
+//                        // Runtimes
+//                        setDeployPropertyIfNeeded('droolsjbpm-build-bootstrap.pr.source.uri', "https://github.com/${getBotAuthor()}/droolsjbpm-build-bootstrap")
+//                        setDeployPropertyIfNeeded('droolsjbpm-build-bootstrap.pr.source.ref', getBotBranch())
+//                        setDeployPropertyIfNeeded('droolsjbpm-build-bootstrap.pr.target.uri', "https://github.com/${getGitAuthor()}/droolsjbpm-build-bootstrap")
+//                        setDeployPropertyIfNeeded('droolsjbpm-build-bootstrap.pr.target.ref', getBuildBranch())
+//                    }
+//                }
+//            }
+//        }
+    }
+    post {
+        always {
+            script {
+                def propertiesStr = deployProperties.collect{ entry ->  "${entry.key}=${entry.value}" }.join("\n")
+                writeFile(text: propertiesStr, file: 'deployment.properties')
+                archiveArtifacts(artifacts: 'deployment.properties')
+            }
+            cleanWs()
+        }
+    }
+}
+
+void checkoutRepo(String repos, String branch) {
+    for( String repo : repos.split(',') ) {
+        dir(repo) {
+            deleteDir()
+            checkout(githubscm.resolveRepository(repo, getGitAuthor(), branch, false))
+        }
+    }
+}
+
+void prepareForPR(String repos) {
+    for( String repo : repos.split(',') ) {
+        dir(repo) {
+            githubscm.forkRepo(getBotAuthorCredsID())
+            githubscm.createBranch(getBotBranch())
+        }
+    }
+}
+
+void commitAndCreatePR(String repos) {
+
+    for( String repo : repos.split(',') ) {
+        dir(repo) {
+            def commitMsg = "[${getBuildBranch()}] Change revapi to check against " + getRevapiProjectName()
+            def prBody = "Generated by build ${BUILD_TAG}: ${BUILD_URL}.\nPlease do not merge, it will be merged automatically after testing."
+
+            githubscm.commitChanges(commitMsg, { githubscm.findAndStageNotIgnoredFiles('revapi-config.json') })
+            githubscm.pushObject('origin', getBotBranch(), getBotAuthorCredsID())
+            deployProperties["${repo}.pr.link"] = githubscm.createPR(commitMsg, prBody, getBuildBranch(), getBotAuthorCredsID())
+        }
+    }
+}
+
+boolean isMergePR() {
+    return params.MERGE_PR
+}
+
+boolean isRelease() {
+    return params.RELEASE
+}
+
+boolean isSkipMavenBuild() {
+    return params.SKIP_MAVEN_BUILD
+}
+
+String getGitAuthor(){
+    return params.GIT_AUTHOR
+}
+
+String getBuildBranch(){
+    return params.BUILD_BRANCH_NAME
+}
+
+String getProjectVersion(){
+    return params.PROJECT_VERSION
+}
+
+String getBotBranch(){
+    return "${getRevapiProjectName()}-${env.BOT_BRANCH_HASH}"
+}
+
+String getBotAuthor(){
+    return params.GIT_AUTHOR_BOT
+}
+
+String getBotAuthorCredsID(){
+    return params.BOT_CREDENTIALS_ID
+}
+
+String getRevapiProjectName() {
+    return "${getProjectVersion()}-${params.REVAPI_RELEASE_VERSION}"
+}
+
+void setDeployPropertyIfNeeded(String key, def value){
+    if (value != null && value != ''){
+        deployProperties[key] = value
+    }
+}
+
+MavenCommand getMavenCommand(String repo){
+    return new MavenCommand(this, ['-fae'])
+                .withSettingsXmlId(params.MAVEN_SETTINGS_CONFIG_FILE_ID)
+                .inDirectory(repo)
+                .withProperty('skip.npm')
+                .withProperty('skip.yarn')
+                .withProperty('gwt.compiler.skip')
+}
+
+void runMavenDeploy(MavenCommand mvnCmd){
+    mvnCmd = mvnCmd.clone()
+
+    if(params.MAVEN_DEPLOY_REPOSITORY){
+        mvnCmd.withDeployRepository(params.MAVEN_DEPLOY_REPOSITORY)
+    }
+
+    mvnCmd.skipTests(true).run('clean deploy')
+}
+
+void runMavenDeployLocally(MavenCommand mvnCmd, String localDeployId) {
+    mvnCmd.clone()
+        .skipTests(true)
+        .withLocalDeployFolder(getLocalDeploymentFolder(localDeployId))
+        .run('clean deploy')
+}
+
+void runMavenStage(MavenCommand mvnCmd, String localDeployId) {
+    MavenStagingHelper stagingHelper = getStagingHelper(mvnCmd)
+    deployProperties.putAll(stagingHelper.stageLocalArtifacts(params.NEXUS_STAGING_PROFILE_ID, getLocalDeploymentFolder(localDeployId)))
+    stagingHelper.promoteStagingRepository(params.NEXUS_BUILD_PROMOTION_PROFILE_ID)
+}
+
+MavenStagingHelper getStagingHelper(MavenCommand mvnCmd) {
+    return new MavenStagingHelper(this, mvnCmd)
+        .withNexusReleaseUrl(params.NEXUS_RELEASE_URL)
+        .withNexusReleaseRepositoryId(params.NEXUS_RELEASE_REPOSITORY_ID)
+}
+
+String getLocalDeploymentFolder(String localDeployId){
+    return "${env.MAVEN_DEPLOY_LOCAL_DIR}/${localDeployId}"
+}
+
+String getRevapiRepos(){
+    return getMasterRevapiRepos() + "," + getBranched7RevapiRepos()
+}
+
+String getMasterRevapiRepos(){
+    return params.MASTER_REVAPI_REPOSITORIES
+}
+
+String getBranched7RevapiRepos(){
+    return params.BRANCHED_7_REVAPI_REPOSITORIES
+}
+
+void cloneAndCheckoutRevapiRepos(String masterRepos, String branched7Repos) {
+    String allRepos = masterRepos + ',' + branched7Repos
+    executeRevapiScripts("${env.WORKSPACE}/droolsjbpm-build-bootstrap/script", 'git-clone-others.sh', allRepos, '--add-upstream-remote')
+    executeRevapiScripts("${env.WORKSPACE}/droolsjbpm-build-bootstrap/script", 'git-all.sh', masterRepos, 'checkout master')
+    executeRevapiScripts("${env.WORKSPACE}/droolsjbpm-build-bootstrap/script", 'git-all.sh', masterRepos, 'pull --rebase upstream master')
+    executeRevapiScripts("${env.WORKSPACE}/droolsjbpm-build-bootstrap/script", 'git-all.sh', branched7Repos, 'checkout 7.x')
+    executeRevapiScripts("${env.WORKSPACE}/droolsjbpm-build-bootstrap/script", 'git-all.sh', branched7Repos, 'pull --rebase upstream 7.x')
+    executeRevapiScripts("${env.WORKSPACE}/droolsjbpm-build-bootstrap/script", 'git-all.sh', allRepos, "checkout -b ${getRevapiProjectName()}")
+}
+
+void executeRevapiScripts(String dirName, String script, String repo, String opts) {
+    dir(dirName) {
+        sh './' + script + ' --repo-list=' + repo +  ' ' + opts
+    }
+}
+
+void executeRevapiClean() {
+
+    dir("${env.WORKSPACE}/droolsjbpm-build-bootstrap/script/utils") {
+        sh(returnStdout: true, script: "cp revapi-clean.sh ${env.WORKSPACE}")
+    }
+
+    dir("${env.WORKSPACE}") {
+        sh './revapi-clean.sh ' + getRevapiProjectName()
+    }
+}
+
+void executeMavenBuild(String repos) {
+    for( String repo : repos.split(',') ) {
+        getMavenCommand(repo).skipTests(true).run('clean install')
+    }
+}
+
+void commitAndPushChanges(String repos, String release) {
+    String commitCmd = "commit -m 'Change revapi to check against " + release + "'"
+    String pushCmd = "push origin revapi-" + release
+    executeRevapiScripts("${env.WORKSPACE}/droolsjbpm-build-bootstrap/script", 'git-all.sh', repos, 'add -u')
+    executeRevapiScripts("${env.WORKSPACE}/droolsjbpm-build-bootstrap/script", 'git-all.sh', repos, commitCmd)
+    executeRevapiScripts("${env.WORKSPACE}/droolsjbpm-build-bootstrap/script", 'git-all.sh', repos, pushCmd)
+}
